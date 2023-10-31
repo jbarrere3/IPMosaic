@@ -64,7 +64,8 @@ make_species_list = function(climate.list, species.in){
   
   expand.grid(species = species.in, climate = names(climate.list)) %>%
     mutate(file = paste0("rds/", climate, "/species/", species, ".rds")) %>%
-    mutate(ID.species = c(1:dim(.)[1])) %>%
+    mutate(ID.species = c(1:dim(.)[1]), 
+           climate = as.character(climate)) %>%
     dplyr::select(ID.species, climate, species, file)
   
   
@@ -83,7 +84,7 @@ make_species_rds = function(
     species = as.character(species.list$species[ID.species.in]), 
     climate = climate.list[[species.list$climate[ID.species.in]]], 
     fit =  param.demo[[species.list$species[ID.species.in]]],
-    clim_lab = paste0("IDspecies_", ID.species.in),
+    clim_lab = species.list$climate[ID.species.in],
     mesh = c(m = 700, L = 100, U = as.numeric(
       param.demo[[species.list$species[ID.species.in]]]$info[["max_dbh"]]) * 1.1),
     BA = 0:200, verbose = TRUE, correction = "none"
@@ -225,7 +226,7 @@ make_simulations_equilibrium = function(
   
   # Run simulation till equilibrium
   sim.in = sim_deter_forest(
-    forest.in, tlim = 2000, equil_time = 2000, equil_dist = 1000, 
+    forest.in, tlim = 5000, equil_time = 5000, equil_dist = 1000, 
     equil_diff = 0.5, harvest = "default", SurfEch = 0.03, verbose = TRUE)
   
   # Save simulation in a rdata
@@ -237,5 +238,259 @@ make_simulations_equilibrium = function(
   return(file.out)
 }
 
+
+#' Function to make a list of simulations till equilibrium
+#' @param species_list df with information on all species object
+#' @param forest_list df with information on all forest to simulate 
+#' @param species vector containing all species rds files created
+#' @param dist boolean to indicate whether we should include disturbance regimes or not
+#' @param ID.forest.in ID of the forest to simulate in forest_list
+make_simulations_reg = function(
+  species.list, forest.list, species, sim_equilibrium, dist, ID.forest.in){
+  
+  # Harvesting rules 
+  harv_rules.ref = c(Pmax = 0.25, dBAmin = 3, freq = 5, alpha = 1)
+  
+  # Identify ID of the climate
+  climate.in = forest.list$climate[ID.forest.in]
+  
+  # Identify species combination i
+  combination.in = forest.list$combi[ID.forest.in]
+  
+  # vector of species with non null abundance in forest i
+  species.in = unlist(strsplit(combination.in, "\\."))
+  
+  # vector of all species in forest i (including regional pool)
+  species.in.all = as.character(unique(subset(species.list, climate == climate.in)$species))
+  
+  # Vector of migration rate 
+  migration_rate.in = rep(0.1, length(species.in.all))
+  names(migration_rate.in) = species.in.all
+  
+  # Get relative abundance at equilibrium
+  # -- Identify forest with all species together
+  ID.forest.equil = (forest.list %>% 
+                       filter(climate == climate.in) %>%
+                       filter(combi == paste(
+                         species.in.all, collapse = ".")))$ID.forest
+  # -- read corresponding simulation at equil
+  sim.equil = readRDS(sim_equilibrium[ID.forest.equil])
+  # -- Extract basal area at equilibrium per species
+  equil.BA = dplyr::filter(sim.equil, equil, var == "BAsp")$value 
+  names(equil.BA) = dplyr::filter(sim.equil, equil, var == "BAsp")$species 
+  # -- Extract size distribution at equilibrium
+  equil_dist <- dplyr::filter(sim.equil, equil, var == "n") %>%
+    dplyr::group_by(species) %>%
+    dplyr::group_split() %>% map(pull, value)
+  
+  # Initialize list of species to create
+  list.species <- vector("list", length(species.in.all))
+  names(list.species) = species.in.all
+  
+  # Loop on all species
+  for(i in 1:length(species.in.all)){
+    
+    # Identify the file in species containing species i
+    species.file.i = species[(species.list %>%
+                                filter(species == species.in.all[i]) %>%
+                                filter(climate == climate.in))$ID.species]
+    
+    # Read species 
+    species.i = readRDS(species.file.i)
+    
+    # If species is not in the combination, set its abundance to 0
+    if(!(species.in.all[i] %in% species.in)){
+      species.i$init_pop = def_init_k(equil_dist[[i]]*0)} 
+    
+    # Update disturbance function if disturbances are included
+    if(dist) species.i$disturb_fun = disturb_fun
+    
+    # Store the file in the list
+    list.species[[i]] = species.i
+    
+  }
+  
+  
+  # Make forest
+  forest.in = new_forest(species = list.species, harv_rules = harv_rules.ref, 
+                         regional_abundance = equil.BA, 
+                         migration_rate = migration_rate.in)
+  
+  # Run simulation 
+  # -- Time of simulation 
+  tsim = 5000
+  # -- In the absence of disturbances
+  if(!dist){
+    sim.in = sim_deter_forest(
+      forest.in, tlim = tsim, equil_time = tsim, equil_dist = 1000, 
+      equil_diff = 0.5, harvest = "default", SurfEch = 0.03, verbose = TRUE)}
+  # -- In the absence of disturbances
+  if(dist){
+    sim.in = sim_deter_forest(
+      forest.in, tlim = tsim, equil_time = tsim, equil_dist = 1000,
+      equil_diff = 0.5, harvest = "default", SurfEch = 0.03, verbose = TRUE,
+      disturbance = make_disturbance.df(t = c(1:tsim), freq = 0.01))}
+  
+  
+  # Save simulation in a rdata
+  if(dist) file.out = paste0("rds/", climate.in, "/sim_reg_dist/", combination.in, ".rds")
+  else file.out = paste0("rds/", climate.in, "/sim_reg/", combination.in, ".rds")
+  create_dir_if_needed(file.out)
+  saveRDS(sim.in, file.out)
+  
+  # Return output list
+  return(file.out)
+}
+
+
+
+#' Function to create disturbance dataframe
+#' @param type type of disturbance ("storm", "fire", or "biotic")
+#' @param freq frequency of the disturbance
+#' @param I.param parameter of beta distribution for intensity
+#' @param t time vector
+make_disturbance.df = function(
+  type = "storm", freq = 0.01, I.param = c(1.97, 5.82), t = c(1:5000)){
+  
+  data.frame(
+    type = type, 
+    intensity = rbeta(length(t), shape1 = I.param[1], shape2 = I.param[2]), 
+    IsSurv = FALSE, t = t)[which(rbinom(length(t), 1, freq) == 1), ]
+  
+}
+
+#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+## matreex functions for regional forest class -------------
+#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+#' species are initiated with their own functions and only the regional abundance
+#' is set in the forest object as well as the migration rate
+
+#' Constructor for forest class
+#'
+#' Only used in the matreex package
+#'
+#' @param species List of species created with matreex package.
+#' @param harv_rules Vector for harvest rules at the scale of the forest.
+#' \describe{
+#'   \item{Pmax}{maximum proportion of BAcut / BA}
+#'   \item{dBAmin}{the minimum BA to perform cut}
+#'   \item{freq}{Frequence at which the harvest will be executed.}
+#' }
+#' @param regional_abundance list of vector with size distribution for each species.
+#' This is not a direct species relative abundance, but I don't know how to implement this...help ,
+#' @param migration_rate numeric vector with a migration rate in percentage between 1 et and 0.
+#'
+#' @importFrom purrr map_chr
+#'
+#' @keywords internal
+#' @export
+new_forest <- function(species = list(),
+                       harv_rules = c(Pmax = 0.25, dBAmin = 3, freq = 1, alpha = 1),
+                       regional_abundance = NULL,
+                       migration_rate = NULL
+){
+  
+  sp <- map_chr(species, sp_name)
+  names(species) <- sp
+  if(!is_null(regional_abundance)){
+    names(regional_abundance) <- sp
+    names(migration_rate) <- sp
+  }
+  forest <- list(
+    species = species, harv_rules = harv_rules,
+    info = list(species = sp,
+                clim_lab = map_chr(species, climatic)),
+    regional_abundance = regional_abundance,
+    migration_rate = migration_rate
+  )
+  
+  if(!is_null(regional_abundance)){
+    class(forest) <- c("forest", "reg_forest")
+  } else {
+    class(forest) <- "forest"
+  }
+  
+  return(forest)
+}
+
+#' validator for forest class.
+#'
+#' @param x forest class object
+#'
+#' @import checkmate
+#'
+#' @noRd
+validate_forest <- function(x){
+  
+  regional <- inherits(x, "reg_forest")
+  values <- unclass(x)
+  names <- attr(x, "names")
+  
+  #map(values$species, validate_species)
+  # TODO check forest harv rules
+  
+  clim_lab <- values$info$clim_lab
+  if(length(unique(clim_lab)) > 1){
+    clim_ipm <- clim_lab[clim_lab != "mu_gr"]
+    if(length(clim_ipm) > 1){ # D & F
+      stop(paste0("Some ipm species are not defined with the same climatic name.",
+                  "Check it with : map_chr(species, climatic)"))
+    }
+  }
+  
+  # check the regional pool settings
+  if(regional){
+    
+    assertNumeric(values$migration_rate, len = length(values$species),
+                  lower = 0, upper = 1)
+    if(all(values$migration_rate == 0)){
+      warning("All migration rate are 0, the regional pool of this forest is deleted")
+      x$regional_abundance <- NULL
+      x$migration_rate <- NULL
+      class(x) <- "forest"
+      
+      return(invisible(x))
+    }
+    
+    assertSubset(names(values$migration_rate), names(values$species))
+    # length_meshs <- map_dbl(values$species, ~ length(.x$IPM$mesh))
+    
+    # assertList(values$regional_abundance, types = "numeric",
+    # len = length(values$species))
+    # if(any(lengths(values$regional_abundance) != length_meshs)){
+    # stop("regional abundance numeric vector should be the length of the species mesh.")
+    # }
+    
+    assertSubset(names(values$regional_abundance), names(values$species))
+  }
+  
+  invisible(x)
+}
+
+#' Create a new forest for simulation
+#'
+#' A forest is a group of one of multiple species to silumate along time using
+#' the IPM defined for each species and harvest rules.
+#'
+#' @inheritParams new_forest
+#'
+#' @export
+forest <- function(species = list(),
+                   harv_rules = c(Pmax = 0.25, dBAmin = 3, freq = 1, alpha = 1),
+                   regional_abundance = NULL,
+                   migration_rate = NULL
+){
+  
+  res <- validate_forest(new_forest(
+    species = species,
+    harv_rules = harv_rules,
+    regional_abundance = regional_abundance,
+    migration_rate = migration_rate
+  ))
+  
+  return(res)
+}
 
 
